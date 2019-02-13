@@ -11,7 +11,9 @@ struct GeometricJacobian{A<:AbstractMatrix}
     angular::A
     linear::A
 
-    @inline function GeometricJacobian(body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D, angular::A, linear::A) where {A<:AbstractMatrix}
+    @inline function GeometricJacobian{A}(
+            body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+            angular::AbstractMatrix, linear::AbstractMatrix) where A<:AbstractMatrix
         @boundscheck size(angular, 1) == 3 || throw(DimensionMismatch())
         @boundscheck size(linear, 1) == 3 || throw(DimensionMismatch())
         @boundscheck size(angular, 2) == size(linear, 2) || throw(DimensionMismatch())
@@ -20,22 +22,22 @@ struct GeometricJacobian{A<:AbstractMatrix}
 end
 
 # GeometricJacobian-specific functions
-Base.convert(::Type{GeometricJacobian{A}}, jac::GeometricJacobian{A}) where {A} = jac
-
-function Base.convert(::Type{GeometricJacobian{A}}, jac::GeometricJacobian) where {A}
-    GeometricJacobian(jac.body, jac.base, jac.frame, convert(A, angular(jac)), convert(A, linear(jac)))
+@inline function GeometricJacobian(
+        body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+        angular::A, linear::A) where {A<:AbstractMatrix}
+    GeometricJacobian{A}(body, base, frame, angular, linear)
 end
 
-Base.Array(jac::GeometricJacobian) = [Array(angular(jac)); Array(linear(jac))]
-Base.eltype(::Type{GeometricJacobian{A}}) where {A} = eltype(A)
+@inline function GeometricJacobian(
+        body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+        angular::A1, linear::A2) where {A1<:AbstractMatrix, A2<:AbstractMatrix}
+    GeometricJacobian(body, base, frame, promote(angular, linear)...)
+end
 
-Base.size(jac::GeometricJacobian) = (6, size(angular(jac), 2))
-Base.size(jac::GeometricJacobian, d) = size(jac)[d]
+@inline function GeometricJacobian{A}(jac::GeometricJacobian) where A
+    GeometricJacobian(jac.body, jac.base, jac.frame, A(angular(jac)), A(linear(jac)))
+end
 
-Base.transpose(jac::GeometricJacobian) = Transpose(jac)
-
-angular(jac::GeometricJacobian) = jac.angular
-linear(jac::GeometricJacobian) = jac.linear
 change_base(jac::GeometricJacobian, base::CartesianFrame3D) = GeometricJacobian(jac.body, base, jac.frame, angular(jac), linear(jac))
 
 Base.:-(jac::GeometricJacobian) = GeometricJacobian(jac.base, jac.body, jac.frame, -angular(jac), -linear(jac))
@@ -49,7 +51,7 @@ $(SIGNATURES)
 
 Transform the `GeometricJacobian` to a different frame.
 """
-function transform(jac::GeometricJacobian, tf::Transform3D)
+@inline function transform(jac::GeometricJacobian, tf::Transform3D)
     @framecheck(jac.frame, tf.from)
     R = rotation(tf)
     ang = R * angular(jac)
@@ -65,12 +67,28 @@ end
 Base.@deprecate PointJacobian{M}(J::M, frame::CartesianFrame3D) where {M<:AbstractMatrix} PointJacobian(frame, J)
 Base.@deprecate PointJacobian(J::AbstractMatrix, frame::CartesianFrame3D) PointJacobian(frame, J)
 
-Base.Array(Jp::PointJacobian) = Matrix(Jp.J)
+# Construct/convert to Matrix
+(::Type{A})(jac::PointJacobian) where {A<:Array} = A(jac.J)
+Base.convert(::Type{A}, jac::PointJacobian) where {A<:Array} = A(jac)
+Base.eltype(::Type{PointJacobian{M}}) where {M} = eltype(M)
 
-function point_velocity(Jp::PointJacobian, v::AbstractVector)
-    FreeVector3D(Jp.frame, Jp.J * v)
+Base.transpose(jac::PointJacobian) = Transpose(jac)
+
+function point_velocity(jac::PointJacobian, v::AbstractVector)
+    FreeVector3D(jac.frame, jac.J * v)
 end
 
+function LinearAlgebra.mul!(τ::AbstractVector, jac_transpose::Transpose{<:Any, <:PointJacobian}, force::FreeVector3D)
+    jac = parent(jac_transpose)
+    @framecheck jac.frame force.frame
+    mul!(τ, transpose(jac.J), force.v)
+end
+
+function Base.:*(jac_transpose::Transpose{<:Any, <:PointJacobian}, force::FreeVector3D)
+    jac = parent(jac_transpose)
+    @framecheck jac.frame force.frame
+    transpose(jac.J) * force.v
+end
 
 """
 $(TYPEDEF)
@@ -107,6 +125,11 @@ struct Twist{T}
     frame::CartesianFrame3D
     angular::SVector{3, T}
     linear::SVector{3, T}
+
+    @inline function Twist{T}(body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+            angular::AbstractVector, linear::AbstractVector) where T
+        new{T}(body, base, frame, angular, linear)
+    end
 end
 
 """
@@ -122,26 +145,32 @@ struct SpatialAcceleration{T}
     frame::CartesianFrame3D
     angular::SVector{3, T}
     linear::SVector{3, T}
+
+    @inline function SpatialAcceleration{T}(body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+            angular::AbstractVector, linear::AbstractVector) where T
+        new{T}(body, base, frame, angular, linear)
+    end
 end
 
 
 for MotionSpaceElement in (:Twist, :SpatialAcceleration)
     @eval begin
+        # Construct with possibly eltype-heterogeneous inputs
+        @inline function $MotionSpaceElement(body::CartesianFrame3D, base::CartesianFrame3D, frame::CartesianFrame3D,
+                angular::AbstractVector{T1}, linear::AbstractVector{T2}) where {T1, T2}
+            $MotionSpaceElement{promote_type(T1, T2)}(body, base, frame, angular, linear)
+        end
+
+        # Construct given FreeVector3Ds
         function $MotionSpaceElement(body::CartesianFrame3D, base::CartesianFrame3D, angular::FreeVector3D, linear::FreeVector3D)
             @framecheck angular.frame linear.frame
             $MotionSpaceElement(body, base, angular.frame, angular.v, linear.v)
         end
 
-        Base.convert(::Type{$MotionSpaceElement{T}}, m::$MotionSpaceElement{T}) where {T} = m
-        function Base.convert(::Type{$MotionSpaceElement{T}}, m::$MotionSpaceElement) where {T}
-            $MotionSpaceElement(m.body, m.base, m.frame, convert(SVector{3, T}, angular(m)), convert(SVector{3, T}, linear(m)))
+        # Construct/convert given another $MotionSpaceElement
+        function $MotionSpaceElement{T}(m::$MotionSpaceElement) where T
+            $MotionSpaceElement(m.body, m.base, m.frame, SVector{3, T}(angular(m)), SVector{3, T}(linear(m)))
         end
-        Base.convert(::Type{Vector{T}}, m::$MotionSpaceElement{T}) where {T} = [angular(m)...; linear(m)...]
-        Base.Array(m::$MotionSpaceElement{T}) where {T} = convert(Vector{T}, m)
-        Base.eltype(::Type{$MotionSpaceElement{T}}) where {T} = T
-
-        angular(m::$MotionSpaceElement) = m.angular
-        linear(m::$MotionSpaceElement) = m.linear
 
         function Base.show(io::IO, m::$MotionSpaceElement)
             print(io, "$($(string(MotionSpaceElement))) of \"$(string(m.body))\" w.r.t \"$(string(m.base))\" in \"$(string(m.frame))\":\nangular: $(angular(m)), linear: $(linear(m))")
@@ -186,7 +215,7 @@ $(SIGNATURES)
 
 Transform the `Twist` to a different frame.
 """
-function transform(twist::Twist, tf::Transform3D)
+@inline function transform(twist::Twist, tf::Transform3D)
     @framecheck(twist.frame, tf.from)
     ang, lin = transform_spatial_motion(angular(twist), linear(twist), rotation(tf), translation(tf))
     Twist(twist.body, twist.base, tf.to, ang, lin)
@@ -300,7 +329,7 @@ function Base.exp(twist::Twist)
     Transform3D(twist.body, twist.base, rot, trans)
 end
 
-function LinearAlgebra.cross(twist1::Twist, twist2::Twist)
+@inline function LinearAlgebra.cross(twist1::Twist, twist2::Twist)
     @framecheck(twist1.frame, twist2.frame)
     ang, lin = se3_commutator(angular(twist1), linear(twist1), angular(twist2), linear(twist2))
     SpatialAcceleration(twist2.body, twist2.base, twist2.frame, ang, lin)

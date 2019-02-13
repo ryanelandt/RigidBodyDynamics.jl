@@ -19,6 +19,11 @@ where ``\\rho(x)`` is the density of point ``x``, and ``p(x)`` are the coordinat
 of point ``x`` expressed in frame ``i``.
 ``J`` is the mass moment of inertia, ``m`` is the total mass, and ``c`` is the
 'cross part', center of mass position scaled by ``m``.
+
+!!! warning
+
+    The `moment` field of a `SpatialInertia` is the moment of inertia **about the origin of its `frame`**,
+    not about the center of mass.
 """
 struct SpatialInertia{T}
     frame::CartesianFrame3D
@@ -26,31 +31,96 @@ struct SpatialInertia{T}
     cross_part::SVector{3, T} # mass times center of mass
     mass::T
 
-    @inline function SpatialInertia(frame::CartesianFrame3D, moment::AbstractMatrix{T}, cross_part::AbstractVector{T}, mass::T) where T
-        @boundscheck size(moment) == (3, 3) || error("size mismatch")
-        @boundscheck size(cross_part) == (3,) || error("size mismatch")
+    @inline function SpatialInertia{T}(frame::CartesianFrame3D, moment::AbstractMatrix, cross_part::AbstractVector, mass) where T
         new{T}(frame, moment, cross_part, mass)
     end
 end
 
+"""
+$(SIGNATURES)
+
+Construct a `SpatialInertia` by specifying:
+
+* `frame`: the frame in which the spatial inertia is expressed.
+* `moment`: the moment of inertia expressed in `frame` (i.e., in `frame`'s axes and about the origin of `frame`).
+* `cross_part`: the center of mass expressed in `frame`, multiplied by the mass.
+* `mass`: the total mass.
+
+For more convenient construction of `SpatialInertia`s, consider using the keyword argument constructor instead.
+"""
+@inline function SpatialInertia(frame::CartesianFrame3D, moment::AbstractMatrix{T1}, cross_part::AbstractVector{T2}, mass::T3) where {T1, T2, T3}
+    SpatialInertia{promote_type(T1, T2, T3)}(frame, moment, cross_part, mass)
+end
+
+"""
+$(SIGNATURES)
+
+Construct a `SpatialInertia` by specifying:
+
+* `frame`: the frame in which the spatial inertia is expressed.
+* one of:
+  * `moment`: the moment of inertia expressed in `frame` (i.e., about the origin of `frame` and in `frame`'s axes).
+  * `moment_about_com`: the moment of inertia about the center of mass, in `frame`'s axes.
+* `com`: the center of mass expressed in `frame`.
+* `mass`: the total mass.
+
+The `com` and `mass` keyword arguments are required, as well as exactly one of `moment` and `moment_about_com`
+"""
+@inline function SpatialInertia(frame::CartesianFrame3D;
+        moment::Union{AbstractMatrix, Nothing}=nothing,
+        moment_about_com::Union{AbstractMatrix, Nothing}=nothing,
+        com::AbstractVector,
+        mass)
+    if !((moment isa AbstractMatrix) ⊻ (moment_about_com isa AbstractMatrix))
+        throw(ArgumentError("Exactly one of `moment` or `moment_about_com` is required."))
+    end
+    _com = SVector{3}(com)
+    if moment !== nothing
+        _moment = moment
+    else
+        _moment = SMatrix{3, 3}(moment_about_com)
+        _moment -= mass * hat_squared(_com) # parallel axis theorem
+    end
+    SpatialInertia(frame, _moment, mass * _com, mass)
+end
+
 # SpatialInertia-specific functions
 Base.eltype(::Type{SpatialInertia{T}}) where {T} = T
-@inline Base.convert(::SpatialInertia{T}, inertia::SpatialInertia{T}) where {T} = inertia
-@inline function Base.convert(::Type{SpatialInertia{T}}, inertia::SpatialInertia) where {T}
-    SpatialInertia(inertia.frame,
-        convert(SMatrix{3, 3, T}, inertia.moment),
-        convert(SVector{3, T}, inertia.cross_part),
-        convert(T, inertia.mass))
-end
-function Base.convert(::Type{SMatrix{6, 6, T}}, inertia::SpatialInertia) where {T}
-    J = inertia.moment
-    C = hat(inertia.cross_part)
-    m = inertia.mass
-    [J  C; C' m * one(SMatrix{3, 3, T})]
-end
-Base.convert(::Type{T}, inertia::SpatialInertia) where {T<:Matrix} = convert(T, convert(SMatrix{6, 6, eltype(T)}, inertia))
 
-Base.Array(inertia::SpatialInertia{T}) where {T} = convert(Matrix{T}, inertia)
+# Construct/convert given another SpatialInertia
+SpatialInertia{T}(inertia::SpatialInertia{T}) where {T} = inertia
+@inline function SpatialInertia{T}(inertia::SpatialInertia) where {T}
+    SpatialInertia{T}(inertia.frame,
+        SMatrix{3, 3, T}(inertia.moment),
+        SVector{3, T}(inertia.cross_part),
+        T(inertia.mass))
+end
+@inline Base.convert(::Type{S}, inertia::SpatialInertia) where {S<:SpatialInertia} = S(inertia)
+
+# Construct/convert to SMatrix
+function StaticArrays.SMatrix{6, 6, T, 36}(inertia::SpatialInertia) where {T}
+    J = SMatrix{3, 3, T}(inertia.moment)
+    C = hat(SVector{3, T}(inertia.cross_part))
+    m = T(inertia.mass)
+    [[J C]; [C' SMatrix{3, 3}(m * I)]]
+end
+StaticArrays.SMatrix{6, 6, T}(inertia::SpatialInertia) where {T} = SMatrix{6, 6, T, 36}(inertia)
+StaticArrays.SMatrix{6, 6}(inertia::SpatialInertia{T}) where {T} = SMatrix{6, 6, T}(inertia)
+StaticArrays.SMatrix(inertia::SpatialInertia) = SMatrix{6, 6}(inertia)
+StaticArrays.SArray(inertia::SpatialInertia) = SMatrix(inertia)
+Base.convert(::Type{A}, inertia::SpatialInertia) where {A<:SArray} = A(inertia)
+
+function Base.convert(::Type{Matrix}, inertia::SpatialInertia) where {T<:Matrix}
+    Base.depwarn("This convert method is deprecated. Please use `$T(SMatrix(inertia))` instead or
+    reconsider whether conversion to Matrix is necessary.", :convert)
+    T(SMatrix(inertia))
+end
+
+function Base.Array(inertia::SpatialInertia)
+    Base.depwarn("This Array constructor is deprecated. Please use `Matrix(SMatrix(inertia))` instead or
+    reconsider whether conversion to Matrix is necessary.", :Array)
+    Matrix(SMatrix(inertia))
+end
 
 """
 $(SIGNATURES)
@@ -60,10 +130,10 @@ Return the center of mass of the `SpatialInertia` as a [`Point3D`](@ref).
 center_of_mass(inertia::SpatialInertia) = Point3D(inertia.frame, inertia.cross_part / inertia.mass)
 
 function Base.show(io::IO, inertia::SpatialInertia)
-    println(io, "SpatialInertia expressed in \"$(string(inertia.frame))\":")
+    println(io, "SpatialInertia expressed in $(name_and_id(inertia.frame)):")
     println(io, "mass: $(inertia.mass)")
     println(io, "center of mass: $(center_of_mass(inertia))")
-    print(io, "moment of inertia:\n$(inertia.moment)")
+    print(io, "moment of inertia (about origin of $(name_and_id(inertia.frame)):\n$(inertia.moment)")
 end
 
 Base.zero(::Type{SpatialInertia{T}}, frame::CartesianFrame3D) where {T} = SpatialInertia(frame, zero(SMatrix{3, 3, T}), zero(SVector{3, T}), zero(T))
@@ -73,7 +143,7 @@ function Base.isapprox(x::SpatialInertia, y::SpatialInertia; atol = 1e-12)
     x.frame == y.frame && isapprox(x.moment, y.moment; atol = atol) && isapprox(x.cross_part, y.cross_part; atol = atol) && isapprox(x.mass, y.mass; atol = atol)
 end
 
-function Base.:+(inertia1::SpatialInertia, inertia2::SpatialInertia)
+@inline function Base.:+(inertia1::SpatialInertia, inertia2::SpatialInertia)
     @framecheck(inertia1.frame, inertia2.frame)
     SpatialInertia(inertia1.frame,
         inertia1.moment + inertia2.moment,
@@ -86,7 +156,7 @@ $(SIGNATURES)
 
 Transform the `SpatialInertia` to a different frame.
 """
-function transform(inertia::SpatialInertia, t::Transform3D)
+@inline function transform(inertia::SpatialInertia, t::Transform3D)
     @framecheck(t.from, inertia.frame)
     J = inertia.moment
     m = inertia.mass
@@ -97,39 +167,31 @@ function transform(inertia::SpatialInertia, t::Transform3D)
     Jnew = hat_squared(cnew)
     cnew += m * p
     Jnew -= hat_squared(cnew)
-    minv = ifelse(m > 0, inv(m), zero(m))
+    minv = m > 0 ? inv(m) : zero(m)
     Jnew *= minv
     Jnew += R * J * R'
     SpatialInertia(t.to, Jnew, cnew, convert(eltype(Jnew), m))
 end
 
 function Random.rand(::Type{<:SpatialInertia{T}}, frame::CartesianFrame3D) where {T}
-    # Try to generate a random but physical moment of inertia
-    # by constructing it from its eigendecomposition
-    Q = rand(RotMatrix3{T}).mat
-    principal_moments = Vector{T}(undef, 3)
+    # Try to generate a random but physical moment of inertia by constructing it from its eigendecomposition.
 
-    # Scale the inertias to make the length scale of the
-    # equivalent inertial ellipsoid roughly ~1 unit
-    principal_moments[1:2] = rand(T, 2) / 10.
+    # Create random principal moments of inertia (about the center of mass).
+    # Scale the inertias to make the length scale of the equivalent inertial ellipsoid roughly ~1 unit
+    ixx = rand(T) / 10.
+    iyy = rand(T) / 10.
 
-    # Ensure that the principal moments of inertia obey the triangle
-    # inequalities:
+    # Ensure that the principal moments of inertia obey the triangle inequalities:
     # http://www.mathworks.com/help/physmod/sm/mech/vis/about-body-color-and-geometry.html
-    lb = abs(principal_moments[1] - principal_moments[2])
-    ub = principal_moments[1] + principal_moments[2]
-    principal_moments[3] = rand(T) * (ub - lb) + lb
+    lb = abs(ixx - iyy)
+    ub = ixx + iyy
+    izz = rand(T) * (ub - lb) + lb
 
-    # Construct the moment of inertia tensor
-    J = SMatrix{3, 3, T}(Q * Diagonal(principal_moments) * Q')
+    # Randomly rotate the principal axes.
+    R = rand(RotMatrix3{T})
+    moment_about_com = R * Diagonal(SVector(ixx, iyy, izz)) * R'
 
-    # Construct the inertia in CoM frame
-    com_frame = CartesianFrame3D()
-    spatial_inertia = SpatialInertia(com_frame, J, zero(SVector{3, T}), rand(T))
-
-    # Put the center of mass at a random offset
-    com_frame_to_desired_frame = Transform3D(com_frame, frame, rand(SVector{3, T}) - T(0.5))
-    transform(spatial_inertia, com_frame_to_desired_frame)
+    SpatialInertia(frame, moment_about_com=moment_about_com, com=rand(SVector{3, T}) .- T(0.5), mass=rand(T))
 end
 
 """
@@ -150,13 +212,13 @@ for (ForceSpaceMatrix, ForceSpaceElement) in (:MomentumMatrix => :Momentum, :Mom
     end
 end
 
-function Base.:*(inertia::SpatialInertia, twist::Twist)
+@inline function Base.:*(inertia::SpatialInertia, twist::Twist)
     @framecheck(inertia.frame, twist.frame)
     ang, lin = mul_inertia(inertia.moment, inertia.cross_part, inertia.mass, angular(twist), linear(twist))
     Momentum(inertia.frame, ang, lin)
 end
 
-function Base.:*(inertia::SpatialInertia, jac::GeometricJacobian)
+@inline function Base.:*(inertia::SpatialInertia, jac::GeometricJacobian)
     @framecheck(inertia.frame, jac.frame)
     Jω = angular(jac)
     Jv = linear(jac)
@@ -177,7 +239,7 @@ to an inertial frame, achieve spatial acceleration ``\\dot{T}``.
 
 This wrench is also equal to the rate of change of momentum of the body.
 """
-function newton_euler(inertia::SpatialInertia, spatial_accel::SpatialAcceleration, twist::Twist)
+@inline function newton_euler(inertia::SpatialInertia, spatial_accel::SpatialAcceleration, twist::Twist)
     I = inertia
     T = twist
     Ṫ = spatial_accel
@@ -198,47 +260,70 @@ function newton_euler(inertia::SpatialInertia, spatial_accel::SpatialAcceleratio
     Wrench(frame, ang, lin)
 end
 
-torque!(τ::AbstractVector, jac::GeometricJacobian, wrench::Wrench) = mul!(τ, transpose(jac), wrench)
+@inline torque!(τ::AbstractVector, jac::GeometricJacobian, wrench::Wrench) = mul!(τ, transpose(jac), wrench)
 
-function torque(jac::GeometricJacobian, wrench::Wrench)
+@inline function torque(jac::GeometricJacobian, wrench::Wrench)
     τ = Vector{promote_type(eltype(jac), eltype(wrench))}(undef, size(jac, 2))
     torque!(τ, jac, wrench)
     τ
 end
 
 for (MatrixType, VectorType) in (:WrenchMatrix => :(Union{Twist, SpatialAcceleration}), :GeometricJacobian => :(Union{Momentum, Wrench}))
-    @eval @inline function LinearAlgebra.mul!(
-            dest::AbstractVector{T},
-            transposed_mat::LinearAlgebra.Transpose{<:Any, <:$MatrixType},
-            vec::$VectorType) where T
-        mat = parent(transposed_mat)
-        @boundscheck length(dest) == size(mat, 2) || throw(DimensionMismatch())
-        @framecheck mat.frame vec.frame
+    @eval begin
+        @inline function LinearAlgebra.mul!(
+                dest::AbstractVector{T},
+                transposed_mat::LinearAlgebra.Transpose{<:Any, <:$MatrixType},
+                vec::$VectorType) where T
+            mat = parent(transposed_mat)
+            @boundscheck length(dest) == size(mat, 2) || throw(DimensionMismatch())
+            @framecheck mat.frame vec.frame
 
-        mat_angular = angular(mat)
-        mat_linear = linear(mat)
-        vec_angular = angular(vec)
-        vec_linear = linear(vec)
+            mat_angular = angular(mat)
+            mat_linear = linear(mat)
+            vec_angular = angular(vec)
+            vec_linear = linear(vec)
 
-        @inbounds begin
-            @simd for row in eachindex(dest)
-                dest[row] =
-                    mat_angular[1, row] * vec_angular[1] +
-                    mat_angular[2, row] * vec_angular[2] +
-                    mat_angular[3, row] * vec_angular[3]
+            @inbounds begin
+                @simd for row in eachindex(dest)
+                    dest[row] =
+                        mat_angular[1, row] * vec_angular[1] +
+                        mat_angular[2, row] * vec_angular[2] +
+                        mat_angular[3, row] * vec_angular[3]
+                end
+                @simd for row in eachindex(dest)
+                    dest[row] +=
+                        mat_linear[1, row] * vec_linear[1] +
+                        mat_linear[2, row] * vec_linear[2] +
+                        mat_linear[3, row] * vec_linear[3]
+                end
             end
-            @simd for row in eachindex(dest)
-                dest[row] +=
-                    mat_linear[1, row] * vec_linear[1] +
-                    mat_linear[2, row] * vec_linear[2] +
-                    mat_linear[3, row] * vec_linear[3]
-            end
+            dest
         end
-        dest
+
+        function Base.:*(transposed_mat::LinearAlgebra.Transpose{<:Any, <:$MatrixType}, vec::$VectorType)
+            mat = parent(transposed_mat)
+            @framecheck mat.frame vec.frame
+            transpose(angular(mat)) * angular(vec) + transpose(linear(mat)) * linear(vec)
+        end
     end
 end
 
-
+for ForceSpaceMatrix in (:MomentumMatrix, :WrenchMatrix)
+    for (A, B) in ((ForceSpaceMatrix, :GeometricJacobian), (:GeometricJacobian, ForceSpaceMatrix))
+        @eval begin
+            function Base.:*(at::LinearAlgebra.Transpose{<:Any, <:$A}, b::$B)
+                a = parent(at)
+                @framecheck a.frame b.frame
+                transpose(angular(a)) * angular(b) + transpose(linear(a)) * linear(b)
+            end
+            function Base.:*(a::$A, bt::LinearAlgebra.Transpose{<:Any, <:$B})
+                b = parent(bt)
+                @framecheck a.frame b.frame
+                angular(a) * transpose(angular(b)) + linear(a) * transpose(linear(b))
+            end
+        end
+    end
+end
 
 """
 $(SIGNATURES)
@@ -246,7 +331,7 @@ $(SIGNATURES)
 Compute the kinetic energy of a body with spatial inertia ``I``, which has
 twist ``T`` with respect to an inertial frame.
 """
-function kinetic_energy(inertia::SpatialInertia, twist::Twist)
+@inline function kinetic_energy(inertia::SpatialInertia, twist::Twist)
     @framecheck(inertia.frame, twist.frame)
     # TODO: should assert that twist.base is an inertial frame somehow
     ω = angular(twist)

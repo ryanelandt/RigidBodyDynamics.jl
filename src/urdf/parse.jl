@@ -34,16 +34,17 @@ function parse_pose(::Type{T}, xml_pose::XMLElement) where {T}
     rot, trans
 end
 
-function parse_joint_type(::Type{T}, xml_joint::XMLElement) where {T}
+function parse_joint_type(::Type{T}, xml_joint::XMLElement,
+        floating_joint_type::Type{<:JointType{T}}, revolute_joint_type::Type{<:JointType{T}}) where {T}
     joint_type = attribute(xml_joint, "type")
     if joint_type == "revolute" || joint_type == "continuous" # TODO: handle joint limits for revolute
         axis = SVector{3}(parse_vector(T, find_element(xml_joint, "axis"), "xyz", "1 0 0"))
-        return Revolute(axis)
+        return revolute_joint_type(axis)
     elseif joint_type == "prismatic"
         axis = SVector{3}(parse_vector(T, find_element(xml_joint, "axis"), "xyz", "1 0 0"))
         return Prismatic(axis)
     elseif joint_type == "floating"
-        return QuaternionFloating{T}()
+        return floating_joint_type()
     elseif joint_type == "fixed"
         return Fixed{T}()
     elseif joint_type == "planar"
@@ -80,9 +81,9 @@ function parse_joint_bounds(jtype::JT, xml_joint::XMLElement) where {T, JT <: Jo
     position_bounds, velocity_bounds, effort_bounds
 end
 
-function parse_joint(::Type{T}, xml_joint::XMLElement) where {T}
+function parse_joint(::Type{T}, xml_joint::XMLElement, floating_joint_type, revolute_joint_type) where {T}
     name = attribute(xml_joint, "name")
-    joint_type = parse_joint_type(T, xml_joint)
+    joint_type = parse_joint_type(T, xml_joint, floating_joint_type, revolute_joint_type)
     position_bounds, velocity_bounds, effort_bounds = parse_joint_bounds(joint_type, xml_joint)
     return Joint(name, joint_type; position_bounds=position_bounds, velocity_bounds=velocity_bounds, effort_bounds=effort_bounds)
 end
@@ -112,12 +113,13 @@ function parse_root_link(mechanism::Mechanism{T}, xml_link::XMLElement, root_joi
     attach!(mechanism, parent, body, joint, joint_pose = joint_to_parent)
 end
 
-function parse_joint_and_link(mechanism::Mechanism{T}, xml_parent::XMLElement, xml_child::XMLElement, xml_joint::XMLElement) where {T}
+function parse_joint_and_link(mechanism::Mechanism{T}, xml_parent::XMLElement, xml_child::XMLElement, xml_joint::XMLElement,
+        floating_joint_type, revolute_joint_type) where {T}
     parentname = attribute(xml_parent, "name")
-    candidate_parents = collect(filter(b -> string(b) == parentname, bodies(mechanism)))
+    candidate_parents = collect(filter(b -> string(b) == parentname, non_root_bodies(mechanism))) # skip root (name not parsed from URDF)
     length(candidate_parents) == 1 || error("Duplicate name: $(parentname)")
     parent = first(candidate_parents)
-    joint = parse_joint(T, xml_joint)
+    joint = parse_joint(T, xml_joint, floating_joint_type, revolute_joint_type)
     pose = parse_pose(T, find_element(xml_joint, "origin"))
     joint_to_parent = Transform3D(frame_before(joint), default_frame(parent), pose...)
     body = parse_body(T, xml_child, frame_after(joint))
@@ -132,13 +134,26 @@ Create a `Mechanism` by parsing a [URDF](https://wiki.ros.org/urdf/XML/model) fi
 Keyword arguments:
 
 * `scalar_type`: the scalar type used to store the `Mechanism`'s kinematic and inertial properties. Default: `Float64`.
-* `root_joint_type`: the joint type used to connect the parsed `Mechanism` to the world. Default: `Fixed{scalar_type}()`.
+* `floating`: whether to use a floating joint as the root joint. Default: false.
+* `floating_joint_type`: what `JointType` to use for floating joints. Default: `QuaternionFloating{scalar_type}`.
+* `revolute_joint_type`: what `JointType` to use for revolute joints. Default: `Revolute{scalar_type}`.
+* `root_joint_type`: the joint type used to connect the parsed `Mechanism` to the world. Default: `floating_joint_type()` if `floating`, `Fixed{scalar_type}()` otherwise.
 * `remove_fixed_tree_joints`: whether to remove any fixed joints present in the kinematic tree using [`remove_fixed_tree_joints!`](@ref). Default: `true`.
+* `gravity`: gravitational acceleration as a 3-vector expressed in the `Mechanism`'s root frame. Default: `$(DEFAULT_GRAVITATIONAL_ACCELERATION)`.
 """
 function parse_urdf(filename::AbstractString;
         scalar_type::Type{T}=Float64,
-        root_joint_type::JointType{T}=Fixed{scalar_type}(),
-        remove_fixed_tree_joints=true) where T
+        floating=false,
+        floating_joint_type::Type{<:JointType{T}}=QuaternionFloating{scalar_type},
+        revolute_joint_type::Type{<:JointType{T}}=Revolute{scalar_type},
+        root_joint_type::JointType{T}=floating ? floating_joint_type() : Fixed{scalar_type}(),
+        remove_fixed_tree_joints=true,
+        gravity::AbstractVector=DEFAULT_GRAVITATIONAL_ACCELERATION) where T
+
+    if floating && !isfloating(root_joint_type)
+        error("Ambiguous input arguments: `floating` specified, but `root_joint_type` is not a floating joint type.")
+    end
+
     xdoc = parse_file(filename)
     xroot = LightXML.root(xdoc)
     @assert LightXML.name(xroot) == "robot"
@@ -165,13 +180,12 @@ function parse_urdf(filename::AbstractString;
     tree = SpanningTree(graph, first(roots))
 
     # create mechanism from spanning tree
-    rootbody = RigidBody{T}("") # initially, set root body name to an empty string, so as not to clash with URDF links named "world"
-    mechanism = Mechanism(rootbody)
+    rootbody = RigidBody{T}("world")
+    mechanism = Mechanism(rootbody, gravity=gravity)
     parse_root_link(mechanism, Graphs.root(tree).data, root_joint_type)
     for edge in edges(tree)
-        parse_joint_and_link(mechanism, source(edge, tree).data, target(edge, tree).data, edge.data)
+        parse_joint_and_link(mechanism, source(edge, tree).data, target(edge, tree).data, edge.data, floating_joint_type, revolute_joint_type)
     end
-    rootbody.name = "world"
 
     if remove_fixed_tree_joints
         remove_fixed_tree_joints!(mechanism)
@@ -181,16 +195,17 @@ function parse_urdf(filename::AbstractString;
 end
 
 @noinline function parse_urdf(scalar_type::Type, filename::AbstractString)
-    replacement = if scalar_type == Float64
-        "parse_urdf(filename, remove_fixed_tree_joints=false)"
-    else
-        "parse_urdf(filename, scalar_type=$scalar_type, remove_fixed_tree_joints=false)"
-    end
-    msg = """
-    `parse_urdf(scalar_type, filename)` is deprecated, use $replacement instead.
-    This is to reproduce the exact same behavior as before.
-    You may want to consider leaving `remove_fixed_tree_joints` to its default value (`true`).
-    """
-    Base.depwarn(msg, :parse_urdf)
+    # TODO: enable deprecation:
+    # replacement = if scalar_type == Float64
+    #     "parse_urdf(filename, remove_fixed_tree_joints=false)"
+    # else
+    #     "parse_urdf(filename, scalar_type=$scalar_type, remove_fixed_tree_joints=false)"
+    # end
+    # msg = """
+    # `parse_urdf(scalar_type, filename)` is deprecated, use $replacement instead.
+    # This is to reproduce the exact same behavior as before.
+    # You may want to consider leaving `remove_fixed_tree_joints` to its default value (`true`).
+    # """
+    # Base.depwarn(msg, :parse_urdf)
     parse_urdf(filename; scalar_type=scalar_type, remove_fixed_tree_joints=false)
 end

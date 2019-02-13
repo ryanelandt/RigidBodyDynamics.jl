@@ -7,7 +7,9 @@ using Rotations
 using TypeSortedCollections
 using DocStringExtensions
 using Reexport
-import Base.Iterators: filter, flatten
+
+using Base.Iterators: filter, flatten
+using Base: @propagate_inbounds
 
 # mechanism-related types
 export
@@ -29,7 +31,8 @@ export
     Prismatic,
     Fixed,
     Planar,
-    QuaternionSpherical
+    QuaternionSpherical,
+    SinCosRevolute
 
 # basic functionality related to mechanism structure
 export
@@ -48,6 +51,7 @@ export
     path,
     joints,
     tree_joints,
+    non_tree_joints,
     successor,
     predecessor,
     in_joints,
@@ -157,9 +161,9 @@ export
     BodyID,
     segments
 
-include("custom_collections.jl")
-include("graphs/Graphs.jl")
-include("spatial/Spatial.jl")
+include(joinpath("custom_collections", "custom_collections.jl"))
+include(joinpath("graphs", "Graphs.jl"))
+include(joinpath("spatial", "Spatial.jl"))
 include("contact.jl")
 include("pdcontrol.jl")
 
@@ -173,7 +177,7 @@ import .Spatial: rotation, translation, transform, center_of_mass, newton_euler,
 
 include("util.jl")
 include("joint.jl")
-include("joint_types.jl")
+include(joinpath("joint_types", "joint_types.jl"))
 include("rigid_body.jl")
 include("mechanism.jl")
 include("mechanism_modification.jl")
@@ -184,7 +188,7 @@ include("mechanism_algorithms.jl")
 include("ode_integrators.jl")
 include("simulate.jl")
 
-include("urdf/URDF.jl")
+include(joinpath("urdf", "URDF.jl"))
 @reexport using .URDF
 
 # import these for MechanismGeometries compatibility. TODO: stop importing these after updating MechanismGeometries.

@@ -1,18 +1,18 @@
 ## BodyDict, JointDict
 const BodyDict{V} = IndexDict{BodyID, Base.OneTo{BodyID}, V}
 const BodyCacheDict{V} = CacheIndexDict{BodyID, Base.OneTo{BodyID}, V}
-Base.@propagate_inbounds Base.getindex(d::AbstractIndexDict{BodyID}, key::RigidBody) = d[BodyID(key)]
-Base.@propagate_inbounds Base.setindex!(d::AbstractIndexDict{BodyID}, value, key::RigidBody) = d[BodyID(key)] = value
+@propagate_inbounds Base.getindex(d::AbstractIndexDict{BodyID}, key::RigidBody) = d[BodyID(key)]
+@propagate_inbounds Base.setindex!(d::AbstractIndexDict{BodyID}, value, key::RigidBody) = d[BodyID(key)] = value
 
 const JointDict{V} = IndexDict{JointID, Base.OneTo{JointID}, V}
 const JointCacheDict{V} = CacheIndexDict{JointID, Base.OneTo{JointID}, V}
-Base.@propagate_inbounds Base.getindex(d::AbstractIndexDict{JointID}, key::Joint) = d[JointID(key)]
-Base.@propagate_inbounds Base.setindex!(d::AbstractIndexDict{JointID}, value, key::Joint) = d[JointID(key)] = value
+@propagate_inbounds Base.getindex(d::AbstractIndexDict{JointID}, key::Joint) = d[JointID(key)]
+@propagate_inbounds Base.setindex!(d::AbstractIndexDict{JointID}, value, key::Joint) = d[JointID(key)] = value
 
 
 ## SegmentedVector method overloads
-Base.@propagate_inbounds Base.getindex(v::SegmentedVector{JointID}, id::JointID) = v.segments[id]
-Base.@propagate_inbounds Base.getindex(v::SegmentedVector{JointID}, joint::Joint) = v[JointID(joint)]
+@propagate_inbounds Base.getindex(v::SegmentedVector{JointID}, id::JointID) = v.segments[id]
+@propagate_inbounds Base.getindex(v::SegmentedVector{JointID}, joint::Joint) = v[JointID(joint)]
 function SegmentedVector(parent::AbstractVector{T}, joints::AbstractVector{<:Joint}, viewlengthfun) where T
     SegmentedVector{JointID, T, Base.OneTo{JointID}}(parent, joints, viewlengthfun)
 end
@@ -47,8 +47,10 @@ struct MechanismState{X, M, C, JointCollection}
     qranges::JointDict{UnitRange{Int}}
     vranges::JointDict{UnitRange{Int}}
     constraintranges::IndexDict{JointID, UnitRange{JointID}, UnitRange{Int}}
-    ancestor_joint_masks::JointDict{JointDict{Bool}} # TODO: use a Matrix-backed type
+    support_set_masks::BodyDict{JointDict{Bool}} # TODO: use a Matrix-backed type
     constraint_jacobian_structure::JointDict{TreePath{RigidBody{M}, Joint{M}}} # TODO: use a Matrix-backed type
+    q_index_to_joint_id::Vector{JointID}
+    v_index_to_joint_id::Vector{JointID}
 
     # minimal representation of state
     q::SegmentedVector{JointID, X, Base.OneTo{JointID}, Vector{X}} # configurations
@@ -80,7 +82,6 @@ struct MechanismState{X, M, C, JointCollection}
         @assert length(s) == num_additional_states(m)
 
         # mechanism layout
-        canonicalize_graph!(m)
         nonrootbodies = collect(non_root_bodies(m))
         treejoints = JointCollection(tree_joints(m))
         nontreejoints = JointCollection(non_tree_joints(m))
@@ -91,9 +92,10 @@ struct MechanismState{X, M, C, JointCollection}
         nontreejointids = lasttreejointid + 1 : lastjointid
         predecessor_and_successor_ids = JointDict{Pair{BodyID, BodyID}}(
             JointID(j) => (BodyID(predecessor(j, m)) => BodyID(successor(j, m))) for j in joints(m))
-        ancestor_joint_mask = joint -> JointDict{Bool}(
-            JointID(j) => j ∈ path(m, successor(joint, m), root_body(m)) for j in tree_joints(m))
-        ancestor_joint_masks = JointDict{JointDict{Bool}}(JointID(j) => ancestor_joint_mask(j) for j in tree_joints(m))
+        support_set = function (b::RigidBody)
+            JointDict{Bool}(JointID(j) => (j ∈ tree_joints(m) ?  j ∈ path(m, b, root_body(m)) : false) for j in joints(m))
+        end
+        support_set_masks = BodyDict{JointDict{Bool}}(b => support_set(b) for b in bodies(m))
         constraint_jacobian_structure = JointDict{TreePath{RigidBody{M}, Joint{M}}}(
             JointID(j) => path(m, predecessor(j, m), successor(j, m)) for j in joints(m))
         qsegmented = SegmentedVector(q, tree_joints(m), num_positions)
@@ -103,6 +105,16 @@ struct MechanismState{X, M, C, JointCollection}
         constraintranges = let start = 1
             rangevec = UnitRange{Int}[start : (start += num_constraints(j)) - 1 for j in non_tree_joints(m)]
             IndexDict(nontreejointids, rangevec)
+        end
+        q_index_to_joint_id = Vector{JointID}(undef, length(q))
+        v_index_to_joint_id = Vector{JointID}(undef, length(v))
+        for jointid in treejointids
+            for qindex in qranges[jointid]
+                q_index_to_joint_id[qindex] = jointid
+            end
+            for vindex in vranges[jointid]
+                v_index_to_joint_id[vindex] = jointid
+            end
         end
 
         # joint-related cache
@@ -150,7 +162,8 @@ struct MechanismState{X, M, C, JointCollection}
         new{X, M, C, JointCollection}(
             modcount(m), m, nonrootbodies, treejoints, nontreejoints,
             jointids, treejointids, nontreejointids,
-            predecessor_and_successor_ids, qranges, vranges, constraintranges, ancestor_joint_masks, constraint_jacobian_structure,
+            predecessor_and_successor_ids, qranges, vranges, constraintranges, support_set_masks, constraint_jacobian_structure,
+            q_index_to_joint_id, v_index_to_joint_id,
             qsegmented, vsegmented, s,
             joint_transforms, joint_twists, joint_bias_accelerations, tree_joint_transforms, non_tree_joint_transforms,
             motion_subspaces, constraint_wrench_subspaces,
@@ -189,8 +202,8 @@ Base.broadcastable(x::MechanismState) = Ref(x)
 Base.show(io::IO, ::MechanismState{X, M, C}) where {X, M, C} = print(io, "MechanismState{$X, $M, $C, …}(…)")
 
 modcount(state::MechanismState) = state.modcount
-Base.@propagate_inbounds predsucc(id::JointID, state::MechanismState) = state.predecessor_and_successor_ids[id]
-Base.@propagate_inbounds successorid(id::JointID, state::MechanismState) = last(state.predecessor_and_successor_ids[id])
+@propagate_inbounds predsucc(id::JointID, state::MechanismState) = state.predecessor_and_successor_ids[id]
+@propagate_inbounds successorid(id::JointID, state::MechanismState) = last(state.predecessor_and_successor_ids[id])
 
 """
 $(SIGNATURES)
@@ -482,10 +495,15 @@ $(SIGNATURES)
 
 Create a `Vector` that represents the same state as `state` (ordered `[q; v; s]`).
 """
-function Base.Vector(state::MechanismState{X}) where {X}
-    dest = Vector{X}(undef, num_positions(state) + num_velocities(state) + num_additional_states(state))
+function Base.Vector{T}(state::MechanismState) where T
+    dest = Vector{T}(undef, num_positions(state) + num_velocities(state) + num_additional_states(state))
     copyto!(dest, state)
 end
+
+Base.Vector(state::MechanismState{X}) where {X} = Vector{X}(state)
+Base.Array{T}(state::MechanismState) where {T} = Vector{T}(state)
+Base.Array(state::MechanismState{X}) where {X} = Array{X}(state)
+Base.convert(::Type{T}, state::MechanismState) where {T<:Array} = T(state)
 
 """
 $(SIGNATURES)
@@ -531,31 +549,54 @@ $(SIGNATURES)
 
 Return the range of indices into the joint configuration vector ``q`` corresponding to joint `joint`.
 """
-@inline configuration_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.qranges[joint]
+@propagate_inbounds configuration_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.qranges[joint]
 
 """
 $(SIGNATURES)
 
 Return the range of indices into the joint velocity vector ``v`` corresponding to joint `joint`.
 """
-@inline velocity_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.vranges[joint]
+@propagate_inbounds velocity_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.vranges[joint]
+
+"""
+$(SIGNATURES)
+
+Return the `JointID` of the joint associated with the given index into the configuration vector ``q``.
+"""
+@propagate_inbounds configuration_index_to_joint_id(state::MechanismState, qindex::Integer) = state.q_index_to_joint_id[qindex]
+
+"""
+$(SIGNATURES)
+
+Return the `JointID` of the joint associated with the given index into the velocity vector ``v``.
+"""
+@propagate_inbounds velocity_index_to_joint_id(state::MechanismState, qindex::Integer) = state.v_index_to_joint_id[qindex]
 
 """
 $(SIGNATURES)
 
 Return the range of row indices into the constraint Jacobian corresponding to joint `joint`.
 """
-@inline constraint_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.constraintranges[joint]
+@propagate_inbounds constraint_range(state::MechanismState, joint::Union{<:Joint, JointID}) = state.constraintranges[joint]
+
+
+"""
+$(SIGNATURES)
+
+Return whether `joint` supports `body`, i.e., `joint` is a tree joint on the path between `body` and the root.
+"""
+@propagate_inbounds function supports(joint::Union{<:Joint, JointID}, body::Union{<:RigidBody, BodyID}, state::MechanismState)
+    state.support_set_masks[body][joint]
+end
 
 ## Accessor functions for cached variables
-
 """
 $(SIGNATURES)
 
 Return the joint transform for the given joint, i.e. the transform from
 `frame_after(joint)` to `frame_before(joint)`.
 """
-Base.@propagate_inbounds function joint_transform(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
+@propagate_inbounds function joint_transform(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
     safe && update_transforms!(state)
     state.joint_transforms[joint]
 end
@@ -566,7 +607,7 @@ Return the joint twist for the given joint, i.e. the twist of
 `frame_after(joint)` with respect to `frame_before(joint)`, expressed in the
 root frame of the mechanism.
 """
-Base.@propagate_inbounds function twist(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
+@propagate_inbounds function twist(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
     safe && update_joint_twists!(state)
     state.joint_twists[joint]
 end
@@ -578,7 +619,7 @@ Return the bias acceleration across the given joint, i.e. the spatial accelerati
 of `frame_after(joint)` with respect to `frame_before(joint)`, expressed in the
 root frame of the mechanism when all joint accelerations are zero.
 """
-Base.@propagate_inbounds function bias_acceleration(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
+@propagate_inbounds function bias_acceleration(state::MechanismState, joint::Union{<:Joint, JointID}, safe=true)
     safe && update_joint_bias_accelerations!(state)
     state.joint_bias_accelerations[joint]
 end
@@ -589,7 +630,7 @@ $(SIGNATURES)
 Return the transform from `default_frame(body)` to the root frame of the
 mechanism.
 """
-Base.@propagate_inbounds function transform_to_root(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function transform_to_root(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     safe && update_transforms!(state)
     state.transforms_to_root[body]
 end
@@ -600,7 +641,7 @@ $(SIGNATURES)
 Return the twist of `default_frame(body)` with respect to the root frame of the
 mechanism, expressed in the root frame.
 """
-Base.@propagate_inbounds function twist_wrt_world(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function twist_wrt_world(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     safe && update_twists_wrt_world!(state)
     state.twists_wrt_world[body]
 end
@@ -613,7 +654,7 @@ i.e. the spatial acceleration of `default_frame(body)` with respect to the
 root frame of the mechanism, expressed in the root frame, when all joint
 accelerations are zero.
 """
-Base.@propagate_inbounds function bias_acceleration(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function bias_acceleration(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     safe && update_bias_accelerations_wrt_world!(state)
     state.bias_accelerations_wrt_world[body]
 end
@@ -624,7 +665,7 @@ $(SIGNATURES)
 Return the spatial inertia of `body` expressed in the root frame of the
 mechanism.
 """
-Base.@propagate_inbounds function spatial_inertia(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function spatial_inertia(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     safe && update_spatial_inertias!(state)
     state.inertias[body]
 end
@@ -635,7 +676,7 @@ $(SIGNATURES)
 Return the composite rigid body inertia `body` expressed in the root frame of the
 mechanism.
 """
-Base.@propagate_inbounds function crb_inertia(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function crb_inertia(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     safe && update_crb_inertias!(state)
     state.crb_inertias[body]
 end
@@ -828,21 +869,21 @@ end
 
 contact_states(state::MechanismState, body::Union{<:RigidBody, BodyID}) = state.contact_states[body]
 
-Base.@propagate_inbounds function newton_euler(state::MechanismState, body::Union{<:RigidBody, BodyID}, accel::SpatialAcceleration, safe=true)
+@propagate_inbounds function newton_euler(state::MechanismState, body::Union{<:RigidBody, BodyID}, accel::SpatialAcceleration, safe=true)
     inertia = spatial_inertia(state, body, safe)
     twist = twist_wrt_world(state, body, safe)
     newton_euler(inertia, accel, twist)
 end
 
-Base.@propagate_inbounds function momentum(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function momentum(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     spatial_inertia(state, body, safe) * twist_wrt_world(state, body, safe)
 end
 
-Base.@propagate_inbounds function momentum_rate_bias(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function momentum_rate_bias(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     newton_euler(state, body, bias_acceleration(state, body, safe), safe)
 end
 
-Base.@propagate_inbounds function kinetic_energy(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function kinetic_energy(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     kinetic_energy(spatial_inertia(state, body, safe), twist_wrt_world(state, body, safe))
 end
 
@@ -853,7 +894,7 @@ Return the gravitational potential energy in the given state, computed as the
 negation of the dot product of the gravitational force and the center
 of mass expressed in the `Mechanism`'s root frame.
 """
-Base.@propagate_inbounds function gravitational_potential_energy(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
+@propagate_inbounds function gravitational_potential_energy(state::MechanismState, body::Union{<:RigidBody, BodyID}, safe=true)
     inertia = spatial_inertia(body)
     m = inertia.mass
     m > 0 || return zero(cache_eltype(state))
@@ -923,7 +964,7 @@ function transform_to_root(state::MechanismState, frame::CartesianFrame3D, safe=
     tf
 end
 
-Base.@propagate_inbounds function statesum(fun::F, state::MechanismState, itr, safe=true; init) where F
+@propagate_inbounds function statesum(fun::F, state::MechanismState, itr, safe=true; init) where F
     ret = init
     for x in itr
         ret += fun(state, x, safe)
@@ -931,28 +972,28 @@ Base.@propagate_inbounds function statesum(fun::F, state::MechanismState, itr, s
     ret
 end
 
-Base.@propagate_inbounds function momentum(state::MechanismState, body_itr)
+@propagate_inbounds function momentum(state::MechanismState, body_itr)
     T = cache_eltype(state)
     update_twists_wrt_world!(state)
     update_spatial_inertias!(state)
     statesum(momentum, state, body_itr, false, init=zero(Momentum{T}, root_frame(state.mechanism)))
 end
 
-Base.@propagate_inbounds function momentum_rate_bias(state::MechanismState, body_itr)
+@propagate_inbounds function momentum_rate_bias(state::MechanismState, body_itr)
     T = cache_eltype(state)
     update_bias_accelerations_wrt_world!(state)
     update_spatial_inertias!(state)
     statesum(momentum_rate_bias, state, body_itr, false, init=zero(Wrench{T}, root_frame(state.mechanism)))
 end
 
-Base.@propagate_inbounds function kinetic_energy(state::MechanismState, body_itr)
+@propagate_inbounds function kinetic_energy(state::MechanismState, body_itr)
     T = cache_eltype(state)
     update_twists_wrt_world!(state)
     update_spatial_inertias!(state)
     statesum(kinetic_energy, state, body_itr, false, init=zero(T))
 end
 
-Base.@propagate_inbounds function gravitational_potential_energy(state::MechanismState, body_itr)
+@propagate_inbounds function gravitational_potential_energy(state::MechanismState, body_itr)
     T = cache_eltype(state)
     update_transforms!(state)
     statesum(gravitational_potential_energy, state, body_itr, false, init=zero(T))

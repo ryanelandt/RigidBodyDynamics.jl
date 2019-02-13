@@ -4,7 +4,7 @@ for ForceSpaceMatrix in (:MomentumMatrix, :WrenchMatrix)
         angular::A
         linear::A
 
-        @inline function $ForceSpaceMatrix(frame::CartesianFrame3D, angular::A, linear::A) where {A<:AbstractMatrix}
+        @inline function $ForceSpaceMatrix{A}(frame::CartesianFrame3D, angular::AbstractMatrix, linear::AbstractMatrix) where {A<:AbstractMatrix}
             @boundscheck size(angular, 1) == 3 || throw(DimensionMismatch())
             @boundscheck size(linear, 1) == 3 || throw(DimensionMismatch())
             @boundscheck size(angular, 2) == size(linear, 2) || throw(DimensionMismatch())
@@ -27,25 +27,23 @@ MomentumMatrix
 
 for ForceSpaceMatrix in (:MomentumMatrix, :WrenchMatrix)
     @eval begin
-        Base.convert(::Type{$ForceSpaceMatrix{A}}, mat::$ForceSpaceMatrix{A}) where {A} = mat
-        function Base.convert(::Type{$ForceSpaceMatrix{A}}, mat::$ForceSpaceMatrix) where {A}
-            $ForceSpaceMatrix(mat.frame, convert(A, angular(mat)), convert(A, linear(mat)))
+        @inline function $ForceSpaceMatrix(frame::CartesianFrame3D, angular::A, linear::A) where {A<:AbstractMatrix}
+            $ForceSpaceMatrix{A}(frame, angular, linear)
         end
-        Base.Array(mat::$ForceSpaceMatrix) = [Array(angular(mat)); Array(linear(mat))]
 
-        Base.eltype(::Type{$ForceSpaceMatrix{A}}) where {A} = eltype(A)
-        Base.size(mat::$ForceSpaceMatrix) = (6, size(angular(mat), 2))
-        Base.size(mat::$ForceSpaceMatrix, d) = size(mat)[d]
-        Base.transpose(mat::$ForceSpaceMatrix) = Transpose(mat)
+        @inline function $ForceSpaceMatrix(frame::CartesianFrame3D, angular::A1, linear::A2) where {A1<:AbstractMatrix, A2<:AbstractMatrix}
+            $ForceSpaceMatrix(frame, promote(angular, linear)...)
+        end
 
-        angular(mat::$ForceSpaceMatrix) = mat.angular
-        linear(mat::$ForceSpaceMatrix) = mat.linear
+        @inline function $ForceSpaceMatrix{A}(mat::$ForceSpaceMatrix) where A
+            $ForceSpaceMatrix(mat.frame, A(angular(mat)), A(linear(mat)))
+        end
 
         function Base.show(io::IO, m::$ForceSpaceMatrix)
             print(io, "$($(string(ForceSpaceMatrix))) expressed in \"$(string(m.frame))\":\n$(Array(m))")
         end
 
-        function transform(mat::$ForceSpaceMatrix, tf::Transform3D)
+        @inline function transform(mat::$ForceSpaceMatrix, tf::Transform3D)
             @framecheck(mat.frame, tf.from)
             R = rotation(tf)
             Av = R * linear(mat)
@@ -76,6 +74,10 @@ struct Momentum{T}
     frame::CartesianFrame3D
     angular::SVector{3, T}
     linear::SVector{3, T}
+
+    @inline function Momentum{T}(frame::CartesianFrame3D, angular::AbstractVector, linear::AbstractVector) where T
+        new{T}(frame, angular, linear)
+    end
 end
 
 """
@@ -103,13 +105,17 @@ struct Wrench{T}
     frame::CartesianFrame3D
     angular::SVector{3, T}
     linear::SVector{3, T}
+
+    @inline function Wrench{T}(frame::CartesianFrame3D, angular::AbstractVector, linear::AbstractVector) where T
+        new{T}(frame, angular, linear)
+    end
 end
 
 for ForceSpaceElement in (:Momentum, :Wrench)
     @eval begin
-        function $ForceSpaceElement(frame::CartesianFrame3D, angular::AbstractVector{T1}, linear::AbstractVector{T2}) where {T1, T2}
-            T = promote_type(T1, T2)
-            $ForceSpaceElement{T}(frame, convert(SVector{3, T}, angular), convert(SVector{3, T}, linear))
+        # Construct with possibly eltype-heterogeneous inputs
+        @inline function $ForceSpaceElement(frame::CartesianFrame3D, angular::AbstractVector{T1}, linear::AbstractVector{T2}) where {T1, T2}
+            $ForceSpaceElement{promote_type(T1, T2)}(frame, angular, linear)
         end
 
         """
@@ -122,16 +128,6 @@ for ForceSpaceElement in (:Momentum, :Wrench)
             @framecheck angular.frame linear.frame
             $ForceSpaceElement(angular.frame, angular.v, linear.v)
         end
-
-        Base.convert(::Type{$ForceSpaceElement{T}}, f::$ForceSpaceElement{T}) where {T} = f
-
-        function Base.convert(::Type{$ForceSpaceElement{T}}, f::$ForceSpaceElement) where {T}
-            $ForceSpaceElement(f.frame, convert(SVector{3, T}, angular(f)), convert(SVector{3, T}, linear(f)))
-        end
-
-        Base.eltype(::Type{$ForceSpaceElement{T}}) where {T} = T
-        angular(f::$ForceSpaceElement) = f.angular
-        linear(f::$ForceSpaceElement) = f.linear
 
         function Base.show(io::IO, f::$ForceSpaceElement)
             print(io, "$($(string(ForceSpaceElement))) expressed in \"$(string(f.frame))\":\nangular: $(angular(f)), linear: $(linear(f))")
@@ -152,7 +148,7 @@ for ForceSpaceElement in (:Momentum, :Wrench)
 
         Transform the $($(string(ForceSpaceElement))) to a different frame.
         """
-        function transform(f::$ForceSpaceElement, tf::Transform3D)
+        @inline function transform(f::$ForceSpaceElement, tf::Transform3D)
             @framecheck(f.frame, tf.from)
             rot = rotation(tf)
             lin = rot * linear(f)
@@ -160,19 +156,18 @@ for ForceSpaceElement in (:Momentum, :Wrench)
             $ForceSpaceElement(tf.to, ang, lin)
         end
 
-        function Base.:+(f1::$ForceSpaceElement, f2::$ForceSpaceElement)
+        @inline function Base.:+(f1::$ForceSpaceElement, f2::$ForceSpaceElement)
             @framecheck(f1.frame, f2.frame)
             $ForceSpaceElement(f1.frame, angular(f1) + angular(f2), linear(f1) + linear(f2))
         end
 
-        function Base.:-(f1::$ForceSpaceElement, f2::$ForceSpaceElement)
+        @inline function Base.:-(f1::$ForceSpaceElement, f2::$ForceSpaceElement)
             @framecheck(f1.frame, f2.frame)
             $ForceSpaceElement(f1.frame, angular(f1) - angular(f2), linear(f1) - linear(f2))
         end
 
-        Base.:-(f::$ForceSpaceElement) = $ForceSpaceElement(f.frame, -angular(f), -linear(f))
+        @inline Base.:-(f::$ForceSpaceElement) = $ForceSpaceElement(f.frame, -angular(f), -linear(f))
 
-        Base.Array(f::$ForceSpaceElement) = vcat(angular(f), linear(f))
         function Base.isapprox(x::$ForceSpaceElement, y::$ForceSpaceElement; atol = 1e-12)
             x.frame == y.frame && isapprox(angular(x), angular(y), atol = atol) && isapprox(linear(x), linear(y), atol = atol)
         end

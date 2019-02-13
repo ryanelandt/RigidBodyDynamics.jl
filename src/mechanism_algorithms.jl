@@ -246,32 +246,25 @@ The `out` argument must be an ``n_v \\times n_v`` lower triangular
 velocity vector ``v``.
 """
 function mass_matrix!(M::Symmetric, state::MechanismState)
-    @boundscheck size(M, 1) == num_velocities(state) || error("mass matrix has wrong size")
-    @boundscheck M.uplo == 'L' || error("expected a lower triangular symmetric matrix type as the mass matrix")
+    nv = num_velocities(state)
+    @boundscheck size(M, 1) == nv || throw(DimensionMismatch("mass matrix has wrong size"))
+    @boundscheck M.uplo == 'L' || throw(ArgumentError(("expected a lower triangular symmetric matrix")))
     update_motion_subspaces!(state)
     update_crb_inertias!(state)
-    fill!(M.data, 0)
     motion_subspaces = state.motion_subspaces.data
-    @inbounds for i in state.treejointids
-        bodyid = successorid(i, state)
-        Ici = crb_inertia(state, bodyid, false)
-        ancestor_joint_mask = values(state.ancestor_joint_masks[i]) # TODO
-        vrangei = velocity_range(state, i)
-        for coli in eachindex(vrangei)
-            vindexi = vrangei[coli]
-            Sicol = motion_subspaces[vindexi]
-            Ficol = Ici * Sicol
-            for j in Base.OneTo(i) # TODO: iterate directly over relevant joint ids
-                if ancestor_joint_mask[j]
-                    vrangej = velocity_range(state, j)
-                    for colj in eachindex(vrangej)
-                        vindexj = vrangej[colj]
-                        Sjcol = motion_subspaces[vindexj]
-                        # TODO: make nicer:
-                        @framecheck Ficol.frame Sjcol.frame
-                        M.data[vindexi, vindexj] = (transpose(angular(Ficol)) * angular(Sjcol) + transpose(linear(Ficol)) * linear(Sjcol))[1]
-                    end
-                end
+    @inbounds for i in Base.OneTo(nv)
+        jointi = velocity_index_to_joint_id(state, i)
+        bodyi = successorid(jointi, state)
+        Ici = crb_inertia(state, bodyi, false)
+        Si = motion_subspaces[i]
+        Fi = Ici * Si
+        for j in Base.OneTo(i)
+            jointj = velocity_index_to_joint_id(state, j)
+            M.data[i, j] = if supports(jointj, bodyi, state)
+                Sj = motion_subspaces[j]
+                (transpose(Fi) * Sj)[1]
+            else
+                zero(eltype(M))
             end
         end
     end
@@ -318,18 +311,17 @@ momentum matrix blocks associated with each of the joints to the frame in which
 $noalloc_doc
 """
 function momentum_matrix!(mat::MomentumMatrix, state::MechanismState, transformfun)
-    @boundscheck num_velocities(state) == size(mat, 2) || throw(DimensionMismatch())
+    nv = num_velocities(state)
+    @boundscheck size(mat, 2) == nv || throw(DimensionMismatch())
     update_motion_subspaces!(state)
     update_crb_inertias!(state)
-    for jointid in state.treejointids # TODO: just use @inbounds here; currently messes with frame check in set_col!
-        @inbounds bodyid = successorid(jointid, state)
-        @inbounds inertia = crb_inertia(state, bodyid)
-        @inbounds vrange = velocity_range(state, jointid)
-        for col in eachindex(vrange)
-            @inbounds vindex = vrange[col]
-            @inbounds Scol = transformfun(inertia * state.motion_subspaces.data[vindex])
-            set_col!(mat, vindex, Scol)
-        end
+    @inbounds for i in 1 : nv
+        jointi = velocity_index_to_joint_id(state, i)
+        bodyi = successorid(jointi, state)
+        Ici = crb_inertia(state, bodyi)
+        Si = state.motion_subspaces.data[i]
+        Fi = transformfun(Ici * Si)
+        set_col!(mat, i, Fi)
     end
     mat
 end
@@ -451,28 +443,18 @@ function joint_wrenches_and_torques!(
         torquesout::SegmentedVector{JointID},
         net_wrenches_in_joint_wrenches_out::AbstractDict{BodyID, <:Wrench}, # TODO: consider having a separate Associative{Joint{M}, Wrench{T}} for joint wrenches
         state::MechanismState)
-    update_transforms!(state)
+    update_motion_subspaces!(state)
     # Note: pass in net wrenches as wrenches argument. wrenches argument is modified to be joint wrenches
     @boundscheck length(torquesout) == num_velocities(state) || error("length of torque vector is wrong")
-
     wrenches = net_wrenches_in_joint_wrenches_out
     for jointid in reverse(state.treejointids)
         parentbodyid, bodyid = predsucc(jointid, state)
         jointwrench = wrenches[bodyid]
-        if parentbodyid != BodyID(1) # TODO: ugly
-            # TODO: consider also doing this for the root:
-            wrenches[parentbodyid] += jointwrench # action = -reaction
+        wrenches[parentbodyid] += jointwrench # action = -reaction
+        for vindex in velocity_range(state, jointid)
+            Scol = state.motion_subspaces.data[vindex]
+            torquesout[vindex] = (transpose(Scol) * jointwrench)[1]
         end
-    end
-
-    joints = state.treejoints
-    qs = values(segments(state.q))
-    τs = values(segments(torquesout))
-    foreach_with_extra_args(state, wrenches, joints, qs, τs) do state, wrenches, joint, qjoint, τjoint
-        # TODO: awkward to transform back to body frame; consider switching to body-frame implementation
-        bodyid = successorid(JointID(joint), state)
-        tf = inv(transform_to_root(state, bodyid, false))
-        joint_torque!(τjoint, joint, qjoint, transform(wrenches[bodyid], tf)) # TODO: consider using motion subspace
     end
 end
 
@@ -606,9 +588,7 @@ function constraint_jacobian!(jac::AbstractMatrix, rowranges, state::MechanismSt
                 for col in eachindex(vrange)
                     vindex = vrange[col]
                     Scol = state.motion_subspaces.data[vindex]
-                    # TODO: make nicer:
-                    @framecheck Tcol.frame Scol.frame
-                    jacelement = flipsign((transpose(angular(Tcol)) * angular(Scol) + transpose(linear(Tcol)) * linear(Scol))[1], sign)
+                    jacelement = flipsign((transpose(Tcol) * Scol)[1], sign)
                     jac[cindex, vindex] = jacelement
                 end
             end

@@ -1,5 +1,13 @@
 function randmech()
-    rand_tree_mechanism(Float64, [QuaternionFloating{Float64}; [Revolute{Float64} for i = 1 : 5]; [Fixed{Float64} for i = 1 : 5]; [QuaternionSpherical{Float64} for i = 1 : 5]; [Prismatic{Float64} for i = 1 : 5]; [Planar{Float64} for i = 1 : 5]; [SPQuatFloating{Float64} for i = 1:2]]...)
+    rand_tree_mechanism(Float64,
+        QuaternionFloating{Float64},
+        [Revolute{Float64} for i = 1 : 5]...,
+        [Fixed{Float64} for i = 1 : 5]...,
+        [Prismatic{Float64} for i = 1 : 5]...,
+        [Planar{Float64} for i = 1 : 5]...,
+        [SPQuatFloating{Float64} for i = 1:2]...,
+        [SinCosRevolute{Float64} for i = 1:2]...
+    )
 end
 
 @testset "mechanism algorithms" begin
@@ -26,6 +34,24 @@ end
             show(IOContext(devnull, :compact => true), body)
         end
         show(devnull, x)
+    end
+
+    @testset "supports" begin
+        Random.seed!(25)
+        mechanism = randmech()
+        mc_mechanism, = maximal_coordinates(mechanism)
+        for m in [mechanism, mc_mechanism]
+            state = MechanismState(m)
+            for body in bodies(m)
+                body_ancestors = RigidBodyDynamics.Graphs.ancestors(body, m.tree)
+                for joint in tree_joints(m)
+                    @test RigidBodyDynamics.supports(joint, body, state) == (successor(joint, m) ∈ body_ancestors)
+                end
+                for joint in non_tree_joints(m)
+                    @test !RigidBodyDynamics.supports(joint, body, state)
+                end
+            end
+        end
     end
 
     @testset "basic stuff" begin
@@ -83,6 +109,15 @@ end
 
         @test @inferred(num_positions(mechanism)) == num_positions(x)
         @test @inferred(num_velocities(mechanism)) == num_velocities(x)
+
+        for joint in tree_joints(mechanism)
+            for i in configuration_range(x, joint)
+                @test RigidBodyDynamics.configuration_index_to_joint_id(x, i) == JointID(joint)
+            end
+            for i in velocity_range(x, joint)
+                @test RigidBodyDynamics.velocity_index_to_joint_id(x, i) == JointID(joint)
+            end
+        end
     end
 
     @testset "copyto! / Vector" begin
@@ -100,6 +135,11 @@ end
         x3 = MechanismState(mechanism)
         copyto!(x3, Vector(x2))
         @test Vector(x3) == Vector(x2)
+
+        @test Vector{Float32}(x1) isa Vector{Float32}
+        @test Vector{Float32}(x1) ≈ Vector(x1) atol=1e-6
+        @test Array(x1) == Array{Float64}(x1) == convert(Array, x1) == convert(Array{Float64}, x1)
+        @test Vector(x1) == Vector{Float64}(x1) == convert(Vector, x1) == convert(Vector{Float64}, x1)
     end
 
     @testset "q̇ <-> v" begin
@@ -143,9 +183,15 @@ end
                 vj = v[vrange]
 
                 Jv_to_q̇_j = RigidBodyDynamics.velocity_to_configuration_derivative_jacobian(joint, qj)
-                @test Jv_to_q̇_j * vj ≈ q̇j
                 Jq̇_to_v_j = RigidBodyDynamics.configuration_derivative_to_velocity_jacobian(joint, qj)
-                @test Jq̇_to_v_j * q̇j ≈ vj
+
+                if num_velocities(joint) > 0
+                    @test Jv_to_q̇_j * vj ≈ q̇j
+                    @test Jq̇_to_v_j * q̇j ≈ vj
+                else
+                    @test size(Jv_to_q̇_j) == (0, 0)
+                    @test size(Jq̇_to_v_j) == (0, 0)
+                end
             end
         end
     end
@@ -192,6 +238,15 @@ end
                 set_configuration!(x, joint, quat)
                 tf = RigidBodyDynamics.joint_transform(joint, configuration(x, joint))
                 @test Quat(rotation(tf)) ≈ quat atol = 1e-12
+            end
+            if joint_type(joint) isa SinCosRevolute
+                qj = rand()
+                set_configuration!(x, joint, qj)
+                @test SVector(sincos(qj)) == configuration(x, joint)
+
+                vj = rand()
+                set_velocity!(x, joint, vj)
+                @test velocity(x, joint)[1] == vj
             end
         end
     end
@@ -318,6 +373,15 @@ end
                 T = Twist(J, velocity(x))
                 point_in_world = transform(x, point, root_frame(mechanism))
                 @test point_velocity(T, point_in_world) ≈ transform(x, point_velocity(J_point, velocity(x)), root_frame(mechanism))
+
+                # Test Jᵀ * f
+                f = FreeVector3D(CartesianFrame3D(), rand(), rand(), rand())
+                τ = similar(velocity(x))
+                @test_throws ArgumentError mul!(τ, transpose(J_point), f)
+                f = FreeVector3D(J_point.frame, rand(), rand(), rand())
+                mul!(τ, transpose(J_point), f)
+                @test τ == transpose(J_point.J) * f.v
+                @test τ == transpose(J_point) * f
             end
         end
 
@@ -357,7 +421,13 @@ end
             S = motion_subspace(joint, configuration(x, joint))
             tf = joint_transform(joint, qjoint)
             T = constraint_wrench_subspace(joint, tf)
-            @test isapprox(angular(T)' * angular(S) + linear(T)' * linear(S), zeros(num_constraints(joint), num_velocities(joint)); atol = 1e-12)
+            if 0 < num_constraints(joint) < 6
+                @test isapprox(angular(T)' * angular(S) + linear(T)' * linear(S), zeros(num_constraints(joint), num_velocities(joint)); atol = 1e-12)
+            elseif num_constraints(joint) == 0
+                @test size(T) == (6, 0)
+            else
+                @test size(S) == (6, 0)
+            end
         end
     end
 
@@ -401,8 +471,8 @@ end
                 set_configuration!(x_autodiff, q_autodiff)
                 set_velocity!(x_autodiff, v_autodiff)
                 twist_autodiff = relative_twist(x_autodiff, body, base)
-                accel_vec = [ForwardDiff.partials(x, 1)::Float64 for x in (Array(twist_autodiff))]
-                @test isapprox(Array(Ṫ), accel_vec; atol = 1e-12)
+                accel_vec = [ForwardDiff.partials(x, 1)::Float64 for x in (SVector(twist_autodiff))]
+                @test isapprox(SVector(Ṫ), accel_vec; atol = 1e-12)
 
                 root = root_body(mechanism)
                 f = default_frame(body)
@@ -625,12 +695,13 @@ end
 
         # rate of change of momentum computed without autodiff:
         ḣ = Wrench(momentum_matrix(x), v̇) + momentum_rate_bias(x)
-        @test isapprox(ḣArray, Array(ḣ); atol = 1e-12)
+        @test isapprox(ḣArray, SVector(ḣ); atol = 1e-12)
     end
 
     @testset "inverse dynamics / external wrenches" begin
+        # test requires a floating mechanism
         Random.seed!(39)
-        mechanism = rand_chain_mechanism(Float64, [QuaternionFloating{Float64}; [Revolute{Float64} for i = 1 : 10]; Planar{Float64}; [Prismatic{Float64} for i = 1 : 10]]...) # what really matters is that there's a floating joint first
+        mechanism = rand_floating_tree_mechanism(Float64, fill(Revolute{Float64}, 10)..., fill(Planar{Float64}, 10)..., fill(SinCosRevolute{Float64}, 5)...)
         x = MechanismState(mechanism)
         rand!(x)
         v̇ = similar(velocity(x))
@@ -735,8 +806,8 @@ end
             rand_configuration!(q0, joint)
             local_coordinates!(ϕ, ϕ̇, joint, q0, q, v)
             q_back = Vector{Float64}(undef, num_positions(joint))
-           global_coordinates!(q_back, joint, q0, ϕ)
-           principal_value!(q_back, joint)
+            global_coordinates!(q_back, joint, q0, ϕ)
+            principal_value!(q_back, joint)
 
             let expected = copy(q)
                 principal_value!(expected, joint)
